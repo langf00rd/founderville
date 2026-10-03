@@ -1,52 +1,204 @@
 // Storage adapter. Everything the game persists goes through FG.storage.
-// Today: browser localStorage. Later: set FG_CONFIG.storage = 'api' and
-// implement the endpoints described in README.md (see docs/schema.sql).
+// Two backends: browser localStorage (offline / no config) and Supabase.
+// The local mirror is always written first, so a failed network write can
+// never lose a run in progress.
 (function (FG) {
   'use strict';
-  const cfg = Object.assign({ storage: 'local', apiBase: '/api' }, globalThis.FG_CONFIG || {});
-  const K = { lb: 'fc.leaderboard.v1', save: 'fc.save.v1', player: 'fc.player.v1' };
+  const cfg = Object.assign(
+    { storage: 'supabase', authRequired: true },
+    globalThis.FG_CONFIG || {}
+  );
+  const SB = FG.supabase;
 
-  const safe = {
+  const K_LB = 'fc.leaderboard.v1';
+  const SERVER_FLUSH_MS = 30000;
+
+  const store = {
     get(k, d) { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : d; } catch (e) { return d; } },
     set(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); return true; } catch (e) { return false; } },
-    del(k) { try { localStorage.removeItem(k); } catch (e) { /* ignore */ } },
+    del(k) { try { localStorage.removeItem(k); } catch (e) {} },
   };
+
+  const online = () => cfg.storage === 'supabase' && SB.configured();
+  const uid = () => { const u = SB.user(); return u && u.id; };
+
+  // Namespaced per account so two people sharing a browser don't see each
+  // other's run or founder name.
+  const keyFor = (kind) => `fc.${kind}.v1.${uid() || 'anon'}`;
 
   const sortLb = (a, b) => a.days - b.days || a.realMs - b.realMs;
 
-  const LocalAdapter = {
-    async getLeaderboard({ productId = null, limit = 50 } = {}) {
-      return safe.get(K.lb, []).filter((e) => !productId || e.productId === productId).sort(sortLb).slice(0, limit);
-    },
-    async submitScore(entry) {
-      const all = safe.get(K.lb, []);
-      all.push(entry);
-      all.sort(sortLb);
-      safe.set(K.lb, all.slice(0, 500));
-      return { rank: all.findIndex((e) => e.id === entry.id) + 1, total: all.length };
-    },
-    async saveGame(state) { return safe.set(K.save, state); },
-    async loadGame() { return safe.get(K.save, null); },
-    async clearGame() { safe.del(K.save); },
-    async getPlayer() { return safe.get(K.player, { name: '' }); },
-    async setPlayer(p) { return safe.set(K.player, p); },
-  };
+  // ---------- gzip (saves are ~190KB of townsfolk raw, ~23KB compressed) ----------
 
-  function ApiAdapter(base) {
-    const j = async (path, opts = {}) => {
-      const r = await fetch(base + path, { headers: { 'Content-Type': 'application/json' }, credentials: 'include', ...opts });
-      if (!r.ok) throw new Error(`${r.status} ${path}`);
-      return r.status === 204 ? null : r.json();
-    };
-    return {
-      getLeaderboard: ({ productId = null, limit = 50 } = {}) => j(`/leaderboard?limit=${limit}${productId ? '&productId=' + encodeURIComponent(productId) : ''}`),
-      submitScore: (entry) => j('/leaderboard', { method: 'POST', body: JSON.stringify(entry) }),
-      // Saves stay local even in API mode (cheap & fast); move server-side if you want cross-device resume.
-      saveGame: LocalAdapter.saveGame, loadGame: LocalAdapter.loadGame, clearGame: LocalAdapter.clearGame,
-      getPlayer: LocalAdapter.getPlayer, setPlayer: LocalAdapter.setPlayer,
-    };
+  const hasCS = () => typeof globalThis.CompressionStream === 'function' && typeof globalThis.DecompressionStream === 'function';
+
+  async function pack(text) {
+    if (!hasCS()) return 'js:' + text;
+    const stream = new Blob([text]).stream().pipeThrough(new CompressionStream('gzip'));
+    const bytes = new Uint8Array(await new Response(stream).arrayBuffer());
+    let bin = '';
+    for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    return 'gz:' + btoa(bin);
   }
 
-  FG.storage = cfg.storage === 'api' ? ApiAdapter(cfg.apiBase) : LocalAdapter;
-  FG.storage.mode = cfg.storage;
-})((globalThis.FG = globalThis.FG || {}));
+  async function unpack(blob) {
+    if (!blob) return null;
+    try {
+      if (blob.slice(0, 3) === 'gz:') {
+        if (!hasCS()) return null;
+        const bin = atob(blob.slice(3));
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+        return JSON.parse(await new Response(stream).text());
+      }
+      return blob.slice(0, 3) === 'js:' ? JSON.parse(blob.slice(3)) : JSON.parse(blob);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // ---------- server saves (debounced write, local mirror always) ----------
+
+  let dirty = null;
+  let flushTimer = 0;
+
+  function scheduleFlush() {
+    if (flushTimer) return;
+    flushTimer = setTimeout(() => { flushTimer = 0; flush(); }, SERVER_FLUSH_MS);
+  }
+
+  async function flush() {
+    const pending = dirty;
+    dirty = null;
+    if (!pending || !online() || !uid()) return;
+    try {
+      await SB.table('saves').upsert({ user_id: uid(), state: await pack(JSON.stringify(pending)) }, 'user_id');
+    } catch (e) { /* local mirror still holds the run; retry on next save */ }
+  }
+
+  async function saveGame(state) {
+    store.set(keyFor('save'), state);
+    if (!online() || !uid()) return true;
+    dirty = state;
+    scheduleFlush();
+    return true;
+  }
+
+  async function loadGame() {
+    const local = store.get(keyFor('save'), null);
+    if (online() && uid()) {
+      try {
+        const rows = await SB.api(`/rest/v1/saves?select=state&user_id=eq.${encodeURIComponent(uid())}&limit=1`);
+        const blob = rows && rows[0] && rows[0].state;
+        if (blob) {
+          const remote = await unpack(blob);
+          if (remote && remote.v === 1) return remote;
+        }
+      } catch (e) { /* fall through to the local mirror */ }
+    }
+    return local && local.v === 1 ? local : null;
+  }
+
+  async function clearGame() {
+    store.del(keyFor('save'));
+    dirty = null;
+    if (flushTimer) { clearTimeout(flushTimer); flushTimer = 0; }
+    if (online() && uid()) {
+      try { await SB.api('/rest/v1/saves?user_id=eq.' + encodeURIComponent(uid()), { method: 'DELETE' }); } catch (e) {}
+    }
+  }
+
+  // ---------- leaderboard ----------
+
+  const fromRow = (r) => ({
+    id: r.id,
+    founder: r.founder,
+    productId: r.product_id,
+    productName: r.product_name,
+    days: r.days,
+    realMs: Number(r.real_ms),
+    badge: r.badge,
+    finishedAt: r.finished_at,
+    actions: r.actions,
+    adSpend: r.ad_spend,
+    seed: r.seed,
+    customerSeg: r.customer_seg,
+    channel: r.channel,
+  });
+
+  const LB_COLS = 'id,founder,product_id,product_name,days,real_ms,badge,finished_at,actions,ad_spend,seed,customer_seg,channel';
+
+  async function getLeaderboard({ productId = null, limit = 50 } = {}) {
+    if (!online()) {
+      return store.get(K_LB, []).filter((e) => !productId || e.productId === productId).sort(sortLb).slice(0, limit);
+    }
+    const q = new URLSearchParams({
+      select: LB_COLS,
+      order: 'days.asc,real_ms.asc,finished_at.asc',
+      limit: String(Math.min(limit, 200)),
+    });
+    if (productId) q.set('product_id', 'eq.' + productId);
+    try {
+      const rows = await SB.table('runs').select(q.toString());
+      return (rows || []).map(fromRow);
+    } catch (e) {
+      return store.get(K_LB, []).filter((e) => !productId || e.productId === productId).sort(sortLb).slice(0, limit);
+    }
+  }
+
+  async function submitScore(entry) {
+    if (!online()) {
+      const all = store.get(K_LB, []);
+      all.push(entry);
+      all.sort(sortLb);
+      store.set(K_LB, all.slice(0, 500));
+      return { rank: all.findIndex((e) => e.id === entry.id) + 1, total: all.length };
+    }
+    if (!uid()) throw new Error('Sign in to record your score.');
+    const r = await SB.table('runs').rpc('submit_run', {
+      p_run_id: entry.id,
+      p_founder: entry.founder,
+      p_product_id: entry.productId,
+      p_product_name: entry.productName,
+      p_days: entry.days,
+      p_real_ms: Math.round(entry.realMs),
+      p_actions: entry.actions | 0,
+      p_ad_spend: entry.adSpend | 0,
+      p_badge: entry.badge,
+      p_seed: Number(entry.seed),
+      p_customer_seg: entry.customerSeg,
+      p_channel: entry.channel,
+    });
+    const row = Array.isArray(r) ? r[0] : r;
+    return { rank: Number(row.rank), total: Number(row.total) };
+  }
+
+  // ---------- player (founder name is a display choice, kept local) ----------
+
+  async function getPlayer() {
+    const p = store.get(keyFor('player'), { name: '' });
+    const u = SB.user();
+    if (u && !p.name) {
+      const meta = u.user_metadata || {};
+      p.name = (meta.full_name || meta.name || meta.user_name || '').trim().slice(0, 20);
+      store.set(keyFor('player'), p);
+    }
+    return p;
+  }
+  async function setPlayer(p) { return store.set(keyFor('player'), p); }
+
+  FG.storage = {
+    mode: online() ? 'supabase' : 'local',
+    configured: online,
+    authRequired: cfg.authRequired,
+    getLeaderboard, submitScore,
+    saveGame, loadGame, clearGame, flush,
+    getPlayer, setPlayer,
+    session: () => SB.getSession(),
+    user: () => SB.user(),
+    signIn: (p) => SB.signInWith(p),
+    signOut: () => SB.signOut(),
+    ready: () => SB.consumeOAuthCallback(),
+  };
+})(globalThis.FG = globalThis.FG || {});

@@ -9,10 +9,19 @@
   const segName = (k) => (D.SEGMENTS[k] ? D.SEGMENTS[k].name : 'Anyone');
   const PI = (id) => D.PRODUCTS[id];
 
-  const ui = { screen: 'title', game: null, saved: null, player: { name: '' }, draft: null, modal: null, action: null, form: {}, result: null, tab: 'log', lbProduct: '', lb: [], end: null, town: null, shell: false };
+  const ui = { screen: 'title', game: null, saved: null, player: { name: '' }, draft: null, modal: null, action: null, form: {}, result: null, tab: 'log', lbProduct: '', lb: [], end: null, town: null, shell: false, auth: 'loading', authErr: '', authBusy: false };
 
   // ---------------- boot ----------------
   async function boot() {
+    const cb = await S.ready();
+    if (cb && cb.error) ui.authErr = cb.error;
+    const u = S.user();
+    if (S.authRequired) {
+      ui.auth = u ? 'in' : 'out';
+      if (!u && FG.supabase.isFileProtocol()) ui.authErr = 'Sign-in needs a web address. Serve the folder (npx serve .) instead of opening the file directly.';
+    } else {
+      ui.auth = 'in';
+    }
     ui.player = await S.getPlayer();
     ui.saved = await S.loadGame();
     if (ui.saved && ui.saved.v !== 1) ui.saved = null;
@@ -20,6 +29,20 @@
     render();
     setInterval(tickTimer, 1000);
     document.addEventListener('visibilitychange', () => { ui.lastTick = Date.now(); });
+    FG.supabase.onSessionChange(async (s) => {
+      ui.auth = s ? 'in' : 'out';
+      if (s) {
+        ui.authErr = '';
+        ui.player = await S.getPlayer();
+        ui.saved = await S.loadGame();
+        if (ui.saved && ui.saved.v !== 1) ui.saved = null;
+      } else {
+        ui.player = { name: '' };
+        ui.saved = null;
+        ui.game = null;
+      }
+      render();
+    });
   }
 
   let lastSave = 0;
@@ -40,8 +63,9 @@
     if (ui.screen !== 'game') {
       if (ui.town) { ui.town.destroy(); ui.town = null; }
       ui.shell = false;
-      app.innerHTML = ({ title: titleScreen, product: productScreen, plan: planScreen, end: endScreen, leaderboard: lbScreen })[ui.screen]() + modalHTML();
-      if (ui.screen === 'title') drawTitleArt();
+      const screen = S.authRequired && ui.auth !== 'in' && ui.screen !== 'signin' && ui.screen !== 'leaderboard' && ui.screen !== 'end' ? 'signin' : ui.screen;
+      app.innerHTML = ({ title: titleScreen, product: productScreen, plan: planScreen, end: endScreen, leaderboard: lbScreen, signin: signInScreen })[screen]() + modalHTML();
+      if (screen === 'title' || screen === 'signin') drawTitleArt();
       if (ui.screen === 'end') drawMedal();
       return;
     }
@@ -66,10 +90,41 @@
   }
 
   // ---------------- title ----------------
+  function accountBar() {
+    const u = S.user();
+    if (!u) return '';
+    const meta = u.user_metadata || {};
+    const pic = meta.picture || meta.avatar_url || '';
+    const label = meta.full_name || meta.name || meta.user_name || (u.email || '').split('@')[0] || 'Founder';
+    const avatar = pic
+      ? `<img class="avatar" src="${esc(pic)}" alt="" referrerpolicy="no-referrer">`
+      : `<span class="avatar fallback">${esc(label.slice(0, 1).toUpperCase())}</span>`;
+    return `<div class="account">${avatar}<span class="who"><b>${esc(label)}</b><small>Signed in</small></span>
+      <button class="btn small" data-a="signout">Sign out</button></div>`;
+  }
+
+  function signInScreen() {
+    if (ui.authBusy) return `<div class="screen center"><div class="panel end-card">
+      <h1 class="logo">FIRST<br>CUSTOMER</h1><p class="tagline">Talking to ${esc((FG.supabase.cfg.providers || ['google'])[0])}…</p>
+      <p class="muted">Finish signing in in the tab that just opened, then come back.</p></div></div>`;
+    const btns = (FG.supabase.cfg.providers || []).map((p) =>
+      `<button class="btn primary wide" data-a="oauth" data-pv="${esc(p)}">${p === 'google' ? 'G' : '⌨'} Continue with ${esc(p[0].toUpperCase() + p.slice(1))}</button>`).join('');
+    return `<div class="screen center"><div class="panel end-card">
+      <canvas id="title-art" width="120" height="56"></canvas>
+      <h1 class="logo">FIRST<br>CUSTOMER</h1>
+      <p class="tagline">You built it. The market is right there.<br>Can you get one person to pay?</p>
+      <div class="signin">${btns}</div>
+      ${ui.authErr ? `<p class="err">${esc(ui.authErr)}</p>` : ''}
+      <p class="muted small">Your score and your save are tied to your account, so you can close the tab and pick up where you left off.</p>
+      <div class="row center"><button class="btn small" data-a="leaderboard">Leaderboard</button><button class="btn small" data-a="help">How to play</button></div>
+    </div></div>`;
+  }
+
   function titleScreen() {
     const s = ui.saved;
     return `<div class="screen center">
       <div class="title-card panel">
+        ${accountBar()}
         <canvas id="title-art" width="120" height="56"></canvas>
         <h1 class="logo">FIRST<br>CUSTOMER</h1>
         <p class="tagline">You built it. The market is right there.<br>Can you get one person to pay?</p>
@@ -480,7 +535,7 @@
   }
 
   function bind() {
-    app.addEventListener('click', (e) => {
+    app.addEventListener('click', async (e) => {
       const t = e.target.closest('[data-a]');
       if (!t || t.disabled) return;
       const a = t.dataset.a;
@@ -488,6 +543,21 @@
       if (t.tagName === 'SELECT') return;
       const g = ui.game;
       switch (a) {
+        case 'oauth': {
+          const p = t.dataset.pv;
+          ui.authErr = '';
+          ui.authBusy = true; render();
+          S.signIn(p).catch((err) => { ui.authBusy = false; ui.authErr = err.message; render(); });
+          break;
+        }
+        case 'signout': {
+          if (ui.game) await S.saveGame(ui.game);
+          await S.flush();
+          await S.signOut();
+          ui.auth = 'out'; ui.game = null; ui.saved = null; ui.player = { name: '' }; ui.screen = 'signin';
+          render();
+          break;
+        }
         case 'new': newGame(); break;
         case 'continue': ui.game = ui.saved; ui.screen = 'game'; ui.modal = null; ui.tab = 'log'; ui.lastTick = Date.now(); render(); break;
         case 'leaderboard': showLeaderboard(); break;

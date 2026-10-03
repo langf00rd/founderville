@@ -12,8 +12,10 @@
 <body>
   <div id="app"></div>
   <noscript>This game needs JavaScript.</noscript>
-  <!-- Plain scripts (no build step) so it runs by double-clicking index.html -->
+  <!-- Plain scripts (no build step). Sign-in needs a real web address, so serve
+       the folder (npx serve .) rather than double-clicking this file. -->
   <script src="js/config.js"></script>
+  <script src="js/supabase.js"></script>
   <script src="js/rng.js"></script>
   <script src="js/data.js"></script>
   <script src="js/market.js"></script>
