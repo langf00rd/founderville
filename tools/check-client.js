@@ -580,6 +580,32 @@ console.log('\n19. network failure on load falls back to the local mirror');
   ok(back && back.day === 7, 'recovered the run from localStorage while offline');
 }
 
+console.log('\n20. saves reach the server at once; a stale server copy never wins');
+{
+  mem.clear();
+  const srv = makeServer();
+  fakeServer = srv;
+  globalThis.fetch = async (u, i) => srv.handler(u, i);
+  const FG = loadClient({ url: 'https://x.supabase.co', anonKey: 'anon_test' });
+  FG.supabase.setSession({
+    access_token: 't', refresh_token: 'r', expires_at: Math.floor(Date.now() / 1000) + 3600, user: { id: 'user-1' },
+  });
+  await FG.storage.saveGame({ v: 1, day: 1, id: 'g_a_b', personas: [] });
+  await FG.storage.flush();
+  ok(srv.saves.has('user-1'), 'day 1 reached the server');
+  await new Promise((r) => setTimeout(r, 5));
+  globalThis.fetch = async () => { throw new Error('offline'); };
+  await FG.storage.saveGame({ v: 1, day: 5, id: 'g_a_b', personas: [] });   // server write fails
+  globalThis.fetch = async (u, i) => srv.handler(u, i);
+  const back = await FG.storage.loadGame();
+  ok(back && back.day === 5, 'reload resumes day 5, not the older server copy: day ' + (back && back.day));
+
+  await FG.storage.saveGame({ v: 1, day: 6, id: 'g_a_b', personas: [] });
+  mem.clear();   // drop the local mirror so only the server copy is left
+  const again = await FG.storage.loadGame();
+  ok(again && again.day === 6, 'each save reaches the server right away: day ' + (again && again.day));
+}
+
 console.log(`\n${pass} passed, ${fail} failed\n`);
 process.exit(fail ? 1 : 0);
 }

@@ -10,12 +10,11 @@
 --           which takes the user id from auth.uid() and rate-limits each
 --           account to one run per 10 seconds and 30 per day.
 --   saves - one row per account, readable and writable only by its owner,
---           capped at 256KB and at one write every 2 seconds.
+--           capped at 1MB.
 
 drop trigger if exists on_auth_user_saved on auth.users;
 drop function if exists public.sync_profile();
 drop table if exists public.saves;
-drop function if exists public.saves_throttle();
 drop table if exists public.runs;
 drop function if exists public.submit_run(text, text, text, text, integer, bigint, integer, integer, text, bigint, text, text);
 drop table if exists public.profiles;
@@ -116,7 +115,7 @@ revoke insert, update, delete on public.runs from anon, authenticated;
 -- state is a gzip+base64 blob ("gz:..."), ~23KB, or plain JSON ("js:...").
 create table public.saves (
   user_id    uuid primary key references public.profiles(id) on delete cascade,
-  state      text not null check (octet_length(state) <= 262144),
+  state      text not null check (octet_length(state) <= 1048576),
   updated_at timestamptz not null default now()
 );
 
@@ -126,27 +125,6 @@ create policy saves_own on public.saves
   for all to authenticated
   using (auth.uid() = user_id)
   with check (auth.uid() = user_id);
-
--- For players, the server sets updated_at and a row cannot be rewritten more
--- than once every 2 seconds. Dashboard and service-role edits are untouched. The client flushes every 30s and swallows a rejected
--- write, retrying on the next save.
-create or replace function public.saves_throttle() returns trigger
-language plpgsql
-set search_path = ''
-as $$
-begin
-  if current_user in ('anon', 'authenticated') then
-    if tg_op = 'UPDATE' and old.updated_at > now() - interval '2 seconds' then
-      raise exception 'saving too often' using errcode = '54000';
-    end if;
-    new.updated_at := now();
-  end if;
-  return new;
-end;
-$$;
-
-create trigger saves_throttle before insert or update on public.saves
-  for each row execute function public.saves_throttle();
 
 -- ---------------------------------------------------------------- submit score
 

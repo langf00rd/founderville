@@ -11,7 +11,6 @@
   const SB = FG.supabase;
 
   const K_LB = 'fc.leaderboard.v1';
-  const SERVER_FLUSH_MS = 30000;
 
   const store = {
     get(k, d) { try { const v = localStorage.getItem(k); return v ? JSON.parse(v) : d; } catch (e) { return d; } },
@@ -58,52 +57,43 @@
     }
   }
 
-  // ---------- server saves (debounced write, local mirror always) ----------
+  // ---------- saves: local mirror first, then the server, on every save ----------
 
-  let dirty = null;
-  let flushTimer = 0;
+  // writes run one after another so an older save can never land last
+  let writing = Promise.resolve();
 
-  function scheduleFlush() {
-    if (flushTimer) return;
-    flushTimer = setTimeout(() => { flushTimer = 0; flush(); }, SERVER_FLUSH_MS);
-  }
-
-  async function flush() {
-    const pending = dirty;
-    dirty = null;
-    if (!pending || !online() || !uid()) return;
-    try {
-      await SB.table('saves').upsert({ user_id: uid(), state: await pack(JSON.stringify(pending)) }, 'user_id');
-    } catch (e) { /* local mirror still holds the run; retry on next save */ }
-  }
-
-  async function saveGame(state) {
+  function saveGame(state) {
+    state.savedAt = Date.now();
     store.set(keyFor('save'), state);
-    if (!online() || !uid()) return true;
-    dirty = state;
-    scheduleFlush();
-    return true;
+    if (!online() || !uid()) return Promise.resolve(true);
+    const id = uid();
+    writing = writing
+      .then(async () => SB.table('saves').upsert({ user_id: id, state: await pack(JSON.stringify(state)) }, 'user_id'))
+      .catch(() => { /* local mirror still holds the run */ });
+    return writing.then(() => true);
   }
+
+  const flush = () => writing;
 
   async function loadGame() {
-    const local = store.get(keyFor('save'), null);
+    let local = store.get(keyFor('save'), null);
+    if (!local || local.v !== 1) local = null;
     if (online() && uid()) {
       try {
         const rows = await SB.api(`/rest/v1/saves?select=state&user_id=eq.${encodeURIComponent(uid())}&limit=1`);
         const blob = rows && rows[0] && rows[0].state;
-        if (blob) {
-          const remote = await unpack(blob);
-          if (remote && remote.v === 1) return remote;
-        }
+        const remote = blob ? await unpack(blob) : null;
+        // the server copy lags the local one by a few seconds, so take
+        // whichever was saved last
+        if (remote && remote.v === 1 && (!local || (remote.savedAt || 0) > (local.savedAt || 0))) return remote;
       } catch (e) { /* fall through to the local mirror */ }
     }
-    return local && local.v === 1 ? local : null;
+    return local;
   }
 
   async function clearGame() {
     store.del(keyFor('save'));
-    dirty = null;
-    if (flushTimer) { clearTimeout(flushTimer); flushTimer = 0; }
+    await writing;   // a save still in flight must not land after the delete
     if (online() && uid()) {
       try { await SB.api('/rest/v1/saves?user_id=eq.' + encodeURIComponent(uid()), { method: 'DELETE' }); } catch (e) {}
     }
