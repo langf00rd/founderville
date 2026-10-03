@@ -125,9 +125,11 @@
     seed: r.seed,
     customerSeg: r.customer_seg,
     channel: r.channel,
+    username: r.profiles && r.profiles.username,
+    avatarUrl: r.profiles && r.profiles.avatar_url,
   });
 
-  const LB_COLS = 'id,founder,product_id,product_name,days,real_ms,badge,finished_at,actions,ad_spend,seed,customer_seg,channel';
+  const LB_COLS = 'id,founder,product_id,product_name,days,real_ms,badge,finished_at,actions,ad_spend,seed,customer_seg,channel,profiles(username,avatar_url)';
 
   async function getLeaderboard({ productId = null, limit = 50 } = {}) {
     if (!online()) {
