@@ -408,7 +408,46 @@ console.log('\n13. concurrent refreshes collapse into one, sign-out wins the rac
   ok(!FG.supabase.user(), 'cannot refresh after signing out');
 }
 
-console.log('\n14. network failure on load falls back to the local mirror');
+console.log('\n15. a callback with no PKCE record fails loudly, never silently');
+{
+  mem.clear();
+  fakeServer = makeServer();
+  globalThis.fetch = async (u, i) => fakeServer.handler(u, i);
+  const FG = loadClient({ url: 'https://x.supabase.co', anonKey: 'anon_test' });
+  ok(!mem.has('fc.pkce.v1'), 'no PKCE record to begin with');
+
+  location.search = '?code=8ce077e0-9fb4-4981-8d77-ee57efaa0785';
+  const res = await FG.supabase.consumeOAuthCallback();
+  ok(res && !!res.error, 'reports an error instead of silently returning null');
+  ok(res && /lost its sign-in attempt/i.test(res.error), 'error explains what happened: ' + (res.error || ''));
+  ok(location.search === '', 'stray ?code= is stripped from the URL');
+  ok(!FG.supabase.user(), 'no session created');
+
+  location.search = '?error=server_error&error_description=Unable+to+exchange+external+code';
+  const res2 = await FG.supabase.consumeOAuthCallback();
+  ok(res2 && res2.error === 'Unable to exchange external code', 'plus-decoded error text');
+  ok(location.search === '', 'error params stripped too');
+}
+
+console.log('\n16. PKCE exchange sends gotrue_meta_security like the official client');
+{
+  mem.clear();
+  const srv = makeServer();
+  fakeServer = srv;
+  globalThis.fetch = async (u, i) => srv.handler(u, i);
+  const FG = loadClient({ url: 'https://x.supabase.co', anonKey: 'anon_test' });
+  await FG.supabase.signInWith('google');
+  const pkce = JSON.parse(mem.get('fc.pkce.v1'));
+  location.search = `?code=abc&state=${encodeURIComponent(pkce.state)}`;
+  await FG.supabase.consumeOAuthCallback();
+  const call = srv.calls.find((c) => c.path === '/auth/v1/token');
+  ok(call && call.body.gotrue_meta_security !== undefined, 'gotrue_meta_security present');
+  ok(call && call.body.code_verifier === pkce.verifier, 'code_verifier sent');
+  ok(call && call.body.auth_code === 'abc', 'auth_code sent');
+  location.search = '';
+}
+
+console.log('\n17. network failure on load falls back to the local mirror');
 {
   const srv = makeServer();
   fakeServer = srv;

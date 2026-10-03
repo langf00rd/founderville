@@ -149,24 +149,30 @@
 
   async function consumeOAuthCallback() {
     const params = new URLSearchParams(location.search);
-    const errDesc = params.get('error_description') || params.get('error');
-    if (errDesc) {
-      history.replaceState({}, '', location.pathname);
-      return { error: errDesc };
-    }
-    const code = params.get('code');
-    const pkce = store.get(K_PKCE, null);
-    if (!code || !pkce) return null;
+    if (!params.toString()) return null;
 
     history.replaceState({}, '', location.pathname);
+
+    const errDesc = params.get('error_description') || params.get('error');
+    if (errDesc) return { error: decodeURIComponent(errDesc.replace(/\+/g, ' ')) };
+
+    const code = params.get('code');
+    const pkce = store.get(K_PKCE, null);
     store.del(K_PKCE);
 
-    if (params.get('state') !== pkce.state) return { error: 'Sign-in state mismatch. Please try again.' };
+    if (!code) return null;
+
+    if (!pkce) {
+      return { error: 'Sign-in could not be completed because the browser lost its sign-in attempt. Start again from this same page.' };
+    }
+    if (params.get('state') !== pkce.state) {
+      return { error: 'Sign-in state mismatch, so the attempt was rejected. Start again.' };
+    }
 
     try {
       const data = await api('/auth/v1/token', {
         method: 'POST',
-        body: { auth_code: code, code_verifier: pkce.verifier },
+        body: { auth_code: code, code_verifier: pkce.verifier, gotrue_meta_security: {} },
         token: null,
         retry: false,
       });
