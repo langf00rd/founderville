@@ -1,4 +1,4 @@
-# First Customer
+# founderville
 
 A pixel-art RPG-style game about the hardest part of starting a company: getting **one person to pay**.
 
@@ -129,4 +129,3 @@ score, and the schema's `verified` column is currently always `false`. The engin
 deterministic from the seed, so the real fix is to also POST the action log, replay it
 with `js/engine.js` (it runs in Node), and only write `verified = true` when the
 recomputed day matches. Worth doing before the leaderboard starts mattering to anyone.
-# founderville

@@ -105,13 +105,13 @@
 
   function signInScreen() {
     if (ui.authBusy) return `<div class="screen center"><div class="panel end-card">
-      <h1 class="logo">FIRST<br>CUSTOMER</h1><p class="tagline">Talking to ${esc((FG.supabase.cfg.providers || ['google'])[0])}…</p>
+      <h1 class="logo">FOUNDERVILLE</h1><p class="tagline">Talking to ${esc((FG.supabase.cfg.providers || ['google'])[0])}…</p>
       <p class="muted">Finish signing in in the tab that just opened, then come back.</p></div></div>`;
     const btns = (FG.supabase.cfg.providers || []).map((p) =>
       `<button class="btn primary wide" data-a="oauth" data-pv="${esc(p)}">${p === 'google' ? 'G' : '⌨'} Continue with ${esc(p[0].toUpperCase() + p.slice(1))}</button>`).join('');
     return `<div class="screen center"><div class="panel end-card">
       <canvas id="title-art" width="120" height="56"></canvas>
-      <h1 class="logo">FIRST<br>CUSTOMER</h1>
+      <h1 class="logo">FOUNDERVILLE</h1>
       <p class="tagline">You built it. The market is right there.<br>Can you get one person to pay?</p>
       <div class="signin">${btns}</div>
       ${ui.authErr ? `<p class="err">${esc(ui.authErr)}</p>` : ''}
@@ -126,7 +126,7 @@
       <div class="title-card panel">
         ${accountBar()}
         <canvas id="title-art" width="120" height="56"></canvas>
-        <h1 class="logo">FIRST<br>CUSTOMER</h1>
+        <h1 class="logo">FOUNDERVILLE</h1>
         <p class="tagline">You built it. The market is right there.<br>Can you get one person to pay?</p>
         <label class="field"><span>Founder name</span><input data-p="name" maxlength="20" value="${esc(ui.player.name)}" placeholder="Your name"></label>
         <div class="menu">

@@ -1,4 +1,4 @@
--- First Customer: Supabase schema.
+-- founderville: Supabase schema.
 -- Run in the Supabase SQL editor. Safe to re-run: drops and recreates.
 --
 -- Security model:
