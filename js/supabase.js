@@ -170,7 +170,11 @@
   }
 
   async function consumeOAuthCallback() {
-    const params = new URLSearchParams(location.search);
+    // Supabase returns the callback in the query string on the PKCE flow, but
+    // read the fragment too so the implicit style works as well.
+    const params = new URLSearchParams(location.search || '');
+    const hash = location.hash && location.hash.charAt(0) === '#' ? location.hash.slice(1) : '';
+    for (const [k, v] of new URLSearchParams(hash)) if (!params.has(k)) params.set(k, v);
     if (!params.toString()) return null;
 
     history.replaceState({}, '', location.pathname);
@@ -179,18 +183,27 @@
     if (errDesc) return { error: decodeURIComponent(errDesc.replace(/\+/g, ' ')) };
 
     const code = params.get('code');
-    const state = params.get('state');
-
     if (!code) return null;
-    if (!state) {
-      // Nothing to match, so drop nothing: wiping here would break a
-      // legitimate sign-in running in another tab.
-      return { error: 'Sign-in came back without a security token. Start again from this page.' };
-    }
 
-    const pkce = takeAttempt(state);
-    if (!pkce) {
-      return { error: 'This sign-in attempt expired or was started in a different browser tab. Start again from this page.' };
+    const state = params.get('state');
+    let pkce;
+    if (state) {
+      pkce = takeAttempt(state);
+      if (!pkce) {
+        return { error: 'This sign-in attempt expired or was started in a different browser tab. Start again from this page.' };
+      }
+    } else {
+      // Some providers come back without echoing state. Accept that only when
+      // a single attempt is in flight: the code is already bound to this tab's
+      // code_challenge, so an injected code cannot be redeemed without the
+      // verifier. With several attempts we cannot tell them apart.
+      const pending = readAttempts();
+      if (pending.length !== 1) {
+        return { error: pending.length
+          ? 'Several sign-in attempts are open at once, so this one cannot be matched. Start again.'
+          : 'Sign-in came back with no security token and no pending attempt. Start again from this page.' };
+      }
+      pkce = takeAttempt(pending[0].state);
     }
 
     try {

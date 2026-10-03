@@ -20,6 +20,7 @@ globalThis.location = {
   pathname: '/',
   protocol: 'https:',
   search: '',
+  hash: '',
   assign(u) { fakeServer.redirectedTo = u; },
 };
 globalThis.history = { replaceState(_s, _t, url) { globalThis.location.search = new URL(url, 'https://game.example.com').search; } };
@@ -419,7 +420,7 @@ console.log('\n15. a callback with no PKCE record fails loudly, never silently')
   location.search = '?code=8ce077e0-9fb4-4981-8d77-ee57efaa0785';
   const res = await FG.supabase.consumeOAuthCallback();
   ok(res && !!res.error, 'reports an error instead of silently returning null');
-  ok(res && /without a security token/.test(res.error), 'error explains what happened: ' + (res.error || ''));
+  ok(res && /no pending attempt/.test(res.error), 'error explains what happened: ' + (res.error || ''));
   ok(location.search === '', 'stray ?code= is stripped from the URL');
   ok(!FG.supabase.user(), 'no session created');
 
@@ -477,21 +478,61 @@ console.log('\n18. overlapping sign-in attempts all complete instead of clobberi
   await FG.supabase.signInWith('google');
   const s = new URL(fakeServer.redirectedTo).searchParams.get('state');
 
+  // the real-world case: Supabase returns the code without echoing state
   location.search = '?code=abc';
   const noState = await FG.supabase.consumeOAuthCallback();
-  ok(noState && /without a security token/.test(noState.error), 'missing state is named as such');
+  ok(noState && !!noState.session, 'state-less callback completes when exactly one attempt is open');
+  ok(FG.supabase.user() && FG.supabase.user().id === 'user-1', 'session established');
   ok(location.search === '', 'URL cleaned');
   location.search = '';
 
-  location.search = `?code=abc&state=${encodeURIComponent(s)}`;
-  const used = await FG.supabase.consumeOAuthCallback();
-  ok(used && !!used.session, 'attempt survives being stashed, then used');
-  location.search = '';
-
-  location.search = `?code=replay&state=${encodeURIComponent(s)}`;
+  location.search = '?code=replay';
   const replay = await FG.supabase.consumeOAuthCallback();
-  ok(replay && /expired|different browser tab/.test(replay.error), 'a used code cannot be replayed');
+  ok(replay && /no pending attempt/.test(replay.error), 'a spent attempt cannot be replayed: ' + (replay.error || ''));
+  ok(!FG.supabase.user() || FG.supabase.accessToken() !== null, 'session untouched by the rejected replay');
   location.search = '';
+}
+{
+  mem.clear();
+  fakeServer = makeServer();
+  globalThis.fetch = async (u, i) => fakeServer.handler(u, i);
+  const FG = loadClient({ url: 'https://x.supabase.co', anonKey: 'anon_test' });
+  await FG.supabase.signInWith('google');
+  await FG.supabase.signInWith('google');
+
+  location.search = '?code=abc';
+  const ambiguous = await FG.supabase.consumeOAuthCallback();
+  ok(ambiguous && /Several sign-in attempts/.test(ambiguous.error), 'state-less callback refused when attempts are ambiguous: ' + (ambiguous.error || ''));
+  ok(!FG.supabase.user(), 'no session from an ambiguous callback');
+  location.search = '';
+}
+{
+  mem.clear();
+  fakeServer = makeServer();
+  globalThis.fetch = async (u, i) => fakeServer.handler(u, i);
+  const FG = loadClient({ url: 'https://x.supabase.co', anonKey: 'anon_test' });
+  await FG.supabase.signInWith('google');
+  const [rec] = JSON.parse(mem.get('fc.pkce.v1'));
+  location.search = '?code=abc&state=forged';
+  const forged = await FG.supabase.consumeOAuthCallback();
+  ok(forged && /expired or was started in a different browser tab/.test(forged.error), 'a state that matches nothing is still rejected');
+  ok(!FG.supabase.user(), 'no session from a forged state');
+  ok(JSON.parse(mem.get('fc.pkce.v1')).some((a) => a.state === rec.state), 'the genuine attempt survives an unrelated forged callback');
+  location.search = '';
+}
+{
+  // params arriving in the fragment rather than the query string
+  mem.clear();
+  fakeServer = makeServer();
+  globalThis.fetch = async (u, i) => fakeServer.handler(u, i);
+  const FG = loadClient({ url: 'https://x.supabase.co', anonKey: 'anon_test' });
+  await FG.supabase.signInWith('google');
+  const st = new URL(fakeServer.redirectedTo).searchParams.get('state');
+  location.search = '';
+  location.hash = `#code=frag&state=${encodeURIComponent(st)}`;
+  const r = await FG.supabase.consumeOAuthCallback();
+  ok(r && !!r.session, 'callback params read from the fragment too');
+  location.hash = '';
 }
 
 console.log('\n19. network failure on load falls back to the local mirror');
