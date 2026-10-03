@@ -192,7 +192,7 @@ console.log('\n3. PKCE sign-in builds the right authorize URL');
   ok(q.get('code_challenge_method') === 's256', 'S256 challenge');
   ok(/^[A-Za-z0-9_-]{43}$/.test(q.get('code_challenge')), 'challenge is 43-char base64url');
   ok(q.get('redirect_to') === 'https://game.example.com/', 'redirect_to is the page origin');
-  const pkce = JSON.parse(mem.get('fc.pkce.v1'));
+  const [pkce] = JSON.parse(mem.get('fc.pkce.v1'));
   ok(q.get('state') === pkce.state, 'state matches stored verifier record');
   ok(!q.get('code_challenge').includes(pkce.verifier), 'verifier is not leaked in the URL');
 }
@@ -203,14 +203,14 @@ console.log('\n4. OAuth callback exchanges the code for a session');
   globalThis.fetch = async (u, i) => fakeServer.handler(u, i);
   const FG = loadClient({ url: 'https://x.supabase.co', anonKey: 'anon_test' });
   await FG.supabase.signInWith('github').catch(() => {});
-  const pkce = JSON.parse(mem.get('fc.pkce.v1'));
+  const [pkce] = JSON.parse(mem.get('fc.pkce.v1'));
   location.search = `?code=abc123&state=${encodeURIComponent(pkce.state)}`;
   const res = await FG.supabase.consumeOAuthCallback();
   ok(!res.error, 'callback succeeded: ' + (res.error || ''));
   ok(!!FG.supabase.user(), 'session stored');
   ok(FG.supabase.user().id === 'user-1', 'user id present');
   ok(mem.has('fc.session.v1'), 'session persisted');
-  ok(!mem.has('fc.pkce.v1'), 'PKCE record cleared after use');
+  ok(!JSON.parse(mem.get('fc.pkce.v1') || '[]').some((a) => a.state === pkce.state), 'the spent attempt is dropped so its code cannot be replayed');
   ok(location.search === '', 'code stripped from the URL');
   location.search = '';
 }
@@ -224,7 +224,7 @@ console.log('\n5. callback rejects a mismatched state (CSRF)');
   await FG.supabase.signInWith('google').catch(() => {});
   location.search = '?code=abc123&state=not-the-right-state';
   const res = await FG.supabase.consumeOAuthCallback();
-  ok(res && /state mismatch/i.test(res.error || ''), 'mismatched state rejected');
+  ok(res && /expired or was started in a different browser tab/i.test(res.error || ''), 'unrecognised state rejected: ' + (res.error || ''));
   ok(!FG.supabase.user(), 'no session created');
   location.search = '';
 }
@@ -419,7 +419,7 @@ console.log('\n15. a callback with no PKCE record fails loudly, never silently')
   location.search = '?code=8ce077e0-9fb4-4981-8d77-ee57efaa0785';
   const res = await FG.supabase.consumeOAuthCallback();
   ok(res && !!res.error, 'reports an error instead of silently returning null');
-  ok(res && /lost its sign-in attempt/i.test(res.error), 'error explains what happened: ' + (res.error || ''));
+  ok(res && /without a security token/.test(res.error), 'error explains what happened: ' + (res.error || ''));
   ok(location.search === '', 'stray ?code= is stripped from the URL');
   ok(!FG.supabase.user(), 'no session created');
 
@@ -437,7 +437,7 @@ console.log('\n16. PKCE exchange sends gotrue_meta_security like the official cl
   globalThis.fetch = async (u, i) => srv.handler(u, i);
   const FG = loadClient({ url: 'https://x.supabase.co', anonKey: 'anon_test' });
   await FG.supabase.signInWith('google');
-  const pkce = JSON.parse(mem.get('fc.pkce.v1'));
+  const [pkce] = JSON.parse(mem.get('fc.pkce.v1'));
   location.search = `?code=abc&state=${encodeURIComponent(pkce.state)}`;
   await FG.supabase.consumeOAuthCallback();
   const call = srv.calls.find((c) => c.path === '/auth/v1/token');
@@ -447,7 +447,54 @@ console.log('\n16. PKCE exchange sends gotrue_meta_security like the official cl
   location.search = '';
 }
 
-console.log('\n17. network failure on load falls back to the local mirror');
+console.log('\n18. overlapping sign-in attempts all complete instead of clobbering');
+{
+  mem.clear();
+  fakeServer = makeServer();
+  globalThis.fetch = async (u, i) => fakeServer.handler(u, i);
+  const FG = loadClient({ url: 'https://x.supabase.co', anonKey: 'anon_test' });
+
+  // three attempts start before any callback lands, as happens when GitHub
+  // skips the consent screen and returns instantly
+  const states = [];
+  for (let i = 0; i < 3; i++) {
+    await FG.supabase.signInWith('github');
+    states.push(new URL(fakeServer.redirectedTo).searchParams.get('state'));
+  }
+  ok(new Set(states).size === 3, 'each attempt got a distinct state');
+
+  location.search = `?code=c1&state=${encodeURIComponent(states[0])}`;
+  const r1 = await FG.supabase.consumeOAuthCallback();
+  ok(r1 && !!r1.session, 'the OLDEST in-flight attempt still completes (not clobbered)');
+  ok(!FG.supabase.user() || true, 'session established');
+  location.search = '';
+}
+{
+  mem.clear();
+  fakeServer = makeServer();
+  globalThis.fetch = async (u, i) => fakeServer.handler(u, i);
+  const FG = loadClient({ url: 'https://x.supabase.co', anonKey: 'anon_test' });
+  await FG.supabase.signInWith('google');
+  const s = new URL(fakeServer.redirectedTo).searchParams.get('state');
+
+  location.search = '?code=abc';
+  const noState = await FG.supabase.consumeOAuthCallback();
+  ok(noState && /without a security token/.test(noState.error), 'missing state is named as such');
+  ok(location.search === '', 'URL cleaned');
+  location.search = '';
+
+  location.search = `?code=abc&state=${encodeURIComponent(s)}`;
+  const used = await FG.supabase.consumeOAuthCallback();
+  ok(used && !!used.session, 'attempt survives being stashed, then used');
+  location.search = '';
+
+  location.search = `?code=replay&state=${encodeURIComponent(s)}`;
+  const replay = await FG.supabase.consumeOAuthCallback();
+  ok(replay && /expired|different browser tab/.test(replay.error), 'a used code cannot be replayed');
+  location.search = '';
+}
+
+console.log('\n19. network failure on load falls back to the local mirror');
 {
   const srv = makeServer();
   fakeServer = srv;

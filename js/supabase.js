@@ -11,6 +11,8 @@
   const K_SESSION = 'fc.session.v1';
   const K_PKCE = 'fc.pkce.v1';
   const SESSION_SKEW_SEC = 60;
+  const ATTEMPT_TTL_MS = 15 * 60 * 1000;
+  const MAX_ATTEMPTS = 8;
 
   const trimSlash = (s) => String(s || '').replace(/\/+$/, '');
   const b64url = (buf) => {
@@ -42,6 +44,26 @@
     if (cfg.redirectTo) return cfg.redirectTo;
     if (isFileProtocol()) return '';
     return location.origin + location.pathname;
+  }
+
+  // Keep every sign-in still in flight, not just the newest. Two overlapping
+  // attempts (second click, or a sign-in started in another tab) otherwise
+  // make the first callback look like a forged state.
+  function readAttempts() {
+    const raw = store.get(K_PKCE, null);
+    const list = Array.isArray(raw) ? raw : raw && raw.state ? [raw] : [];
+    const fresh = list.filter((a) => a && a.state && Date.now() - a.at < ATTEMPT_TTL_MS);
+    return fresh.slice(-MAX_ATTEMPTS);
+  }
+
+  function pushAttempt(a) {
+    store.set(K_PKCE, readAttempts().concat([a]).slice(-MAX_ATTEMPTS));
+  }
+
+  function takeAttempt(state) {
+    const list = readAttempts();
+    store.set(K_PKCE, list.filter((a) => a.state !== state));
+    return list.find((a) => a.state === state) || null;
   }
 
   async function sha256(text) {
@@ -134,7 +156,7 @@
     if (!digest) throw new Error('This browser cannot do OAuth sign-in (no crypto.subtle).');
 
     const state = randomStr(16);
-    store.set(K_PKCE, { verifier, state, at: Date.now() });
+    pushAttempt({ verifier, state, at: Date.now() });
 
     const q = new URLSearchParams({
       provider,
@@ -157,16 +179,18 @@
     if (errDesc) return { error: decodeURIComponent(errDesc.replace(/\+/g, ' ')) };
 
     const code = params.get('code');
-    const pkce = store.get(K_PKCE, null);
-    store.del(K_PKCE);
+    const state = params.get('state');
 
     if (!code) return null;
-
-    if (!pkce) {
-      return { error: 'Sign-in could not be completed because the browser lost its sign-in attempt. Start again from this same page.' };
+    if (!state) {
+      // Nothing to match, so drop nothing: wiping here would break a
+      // legitimate sign-in running in another tab.
+      return { error: 'Sign-in came back without a security token. Start again from this page.' };
     }
-    if (params.get('state') !== pkce.state) {
-      return { error: 'Sign-in state mismatch, so the attempt was rejected. Start again.' };
+
+    const pkce = takeAttempt(state);
+    if (!pkce) {
+      return { error: 'This sign-in attempt expired or was started in a different browser tab. Start again from this page.' };
     }
 
     try {
