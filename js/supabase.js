@@ -129,6 +129,7 @@
       try {
         const data = await api('/auth/v1/token', {
           method: 'POST',
+          query: 'grant_type=refresh_token',
           body: { refresh_token: session.refresh_token },
           token: null,
           retry: false,
@@ -186,38 +187,48 @@
     if (!code) return null;
 
     const state = params.get('state');
-    let pkce;
     if (state) {
-      pkce = takeAttempt(state);
+      const pkce = takeAttempt(state);
       if (!pkce) {
         return { error: 'This sign-in attempt expired or was started in a different browser tab. Start again from this page.' };
       }
-    } else {
-      // Some providers come back without echoing state. Accept that only when
-      // a single attempt is in flight: the code is already bound to this tab's
-      // code_challenge, so an injected code cannot be redeemed without the
-      // verifier. With several attempts we cannot tell them apart.
-      const pending = readAttempts();
-      if (pending.length !== 1) {
-        return { error: pending.length
-          ? 'Several sign-in attempts are open at once, so this one cannot be matched. Start again.'
-          : 'Sign-in came back with no security token and no pending attempt. Start again from this page.' };
-      }
-      pkce = takeAttempt(pending[0].state);
+      return exchange(code, [pkce]);
     }
 
-    try {
-      const data = await api('/auth/v1/token', {
-        method: 'POST',
-        body: { auth_code: code, code_verifier: pkce.verifier, gotrue_meta_security: {} },
-        token: null,
-        retry: false,
-      });
-      setSession(data);
-      return { session: data };
-    } catch (e) {
-      return { error: e.message };
+    // Supabase does not echo the client's state back on the PKCE redirect, so
+    // there is nothing to match on. Try each pending verifier, newest first:
+    // the server keeps the code until a verifier matches, and a code that was
+    // injected is bound to someone else's challenge, so none of ours redeem it.
+    const pending = readAttempts().reverse();
+    if (!pending.length) {
+      return { error: 'Sign-in came back with no security token and no pending attempt. Start again from this page.' };
     }
+    return exchange(code, pending);
+  }
+
+  const badVerifier = (e) =>
+    (e.data && e.data.error_code === 'bad_code_verifier') || /code verifier|code challenge/i.test(e.message);
+
+  async function exchange(code, candidates) {
+    let last;
+    for (const pkce of candidates) {
+      try {
+        const data = await api('/auth/v1/token', {
+          method: 'POST',
+          query: 'grant_type=pkce',
+          body: { auth_code: code, code_verifier: pkce.verifier, gotrue_meta_security: {} },
+          token: null,
+          retry: false,
+        });
+        takeAttempt(pkce.state);
+        setSession(data);
+        return { session: data };
+      } catch (e) {
+        last = e;
+        if (!badVerifier(e)) break;
+      }
+    }
+    return { error: last.message };
   }
 
   async function signOut() {

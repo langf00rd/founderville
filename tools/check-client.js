@@ -53,9 +53,16 @@ function makeServer(opts = {}) {
       if (path === '/auth/v1/authorize') return new Response(null, { status: 200 });
       if (path === '/auth/v1/token' && q.get('grant_type') === 'pkce') {
         if (opts.rejectPkce) return json({ msg: 'bad code' }, 400);
+        const body = JSON.parse(init.body);
+        if (opts.verifier && body.code_verifier !== opts.verifier) {
+          return json({ code: 400, error_code: 'bad_code_verifier', msg: 'code challenge does not match previously saved code verifier' }, 400);
+        }
         const s = newSession();
         this.session = s;
         return json(s);
+      }
+      if (path === '/auth/v1/token' && q.get('grant_type') !== 'refresh_token') {
+        return json({ code: 400, error_code: 'unsupported_grant_type', msg: 'unsupported_grant_type' }, 400);
       }
       if (path === '/auth/v1/token') {
         if (opts.expireRefresh) return json({ msg: 'invalid refresh token' }, 401);
@@ -499,11 +506,33 @@ console.log('\n18. overlapping sign-in attempts all complete instead of clobberi
   const FG = loadClient({ url: 'https://x.supabase.co', anonKey: 'anon_test' });
   await FG.supabase.signInWith('google');
   await FG.supabase.signInWith('google');
+  await FG.supabase.signInWith('github');
+  const attempts = JSON.parse(mem.get('fc.pkce.v1'));
+  fakeServer = makeServer({ verifier: attempts[0].verifier });
 
+  // Supabase never echoes state, so several stale attempts must not block the
+  // one that actually came back
   location.search = '?code=abc';
-  const ambiguous = await FG.supabase.consumeOAuthCallback();
-  ok(ambiguous && /Several sign-in attempts/.test(ambiguous.error), 'state-less callback refused when attempts are ambiguous: ' + (ambiguous.error || ''));
-  ok(!FG.supabase.user(), 'no session from an ambiguous callback');
+  const r = await FG.supabase.consumeOAuthCallback();
+  ok(r && !!r.session, 'state-less callback completes with several attempts open: ' + (r.error || ''));
+  const tried = fakeServer.calls.filter((c) => c.path === '/auth/v1/token').map((c) => c.body.code_verifier);
+  ok(tried[tried.length - 1] === attempts[0].verifier, 'redeemed with the verifier that matches the code');
+  const left = JSON.parse(mem.get('fc.pkce.v1')).map((a) => a.state);
+  ok(!left.includes(attempts[0].state) && left.length === 2, 'only the spent attempt is dropped');
+  location.search = '';
+}
+{
+  mem.clear();
+  fakeServer = makeServer({ rejectPkce: true });
+  globalThis.fetch = async (u, i) => fakeServer.handler(u, i);
+  const FG = loadClient({ url: 'https://x.supabase.co', anonKey: 'anon_test' });
+  await FG.supabase.signInWith('google');
+  await FG.supabase.signInWith('google');
+  location.search = '?code=dead';
+  const r = await FG.supabase.consumeOAuthCallback();
+  ok(r && r.error === 'bad code', 'a dead code reports the server error');
+  ok(fakeServer.calls.filter((c) => c.path === '/auth/v1/token').length === 1, 'stops after an error that is not a verifier mismatch');
+  ok(!FG.supabase.user(), 'no session from a dead code');
   location.search = '';
 }
 {
